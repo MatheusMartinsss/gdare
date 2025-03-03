@@ -9,6 +9,7 @@ const fs = require('fs')
 
 // Middleware to parse JSON requests
 app.use(express.json())
+
 app.listen(port, () => {
     console.log(`Servidor rodando na porta ${port}`)
 })
@@ -53,16 +54,8 @@ app.post('/dare', async (req, res) => {
 
         // Launch browser and create page
         browser = await puppeteer.launch({
-            executablePath: await chrome.executablePath(),
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--single-process'
-            ],
-            headless: 'new',
-            ignoreHTTPSErrors: true,
-            userDataDir: '/opt/render/.cache/puppeteer'
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
         const page = await browser.newPage();
 

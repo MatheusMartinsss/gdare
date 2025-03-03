@@ -4,14 +4,12 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "npx postinstall node . index.js",
-    "postinstall": "node postinstall.js"
+    "start": "node  index.js"
   },
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "chrome-aws-lambda": "10.1.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "puppeteer": "^24.3.0"
