@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "npm postinstall node . index.js",
+    "start": "npx postinstall node . index.js",
     "postinstall": "node postinstall.js"
   },
   "author": "",
