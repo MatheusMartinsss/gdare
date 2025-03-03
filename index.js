@@ -55,7 +55,8 @@ app.post('/dare', async (req, res) => {
         // Launch browser and create page
         browser = await puppeteer.launch({
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            executablePath: process.env.PUPPETER_EXECUTABLE_PATH,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process', '--no-zygote']
         });
         const page = await browser.newPage();
 
