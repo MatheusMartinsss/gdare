@@ -100,7 +100,7 @@ app.post('/dare', async (req, res) => {
         // Wait for the DARE document table to appear
         await page.waitForSelector('table.mb_20.text-size-13', {
             visible: true,
-            timeout: 10000 // 15 seconds
+            timeout: 30000 // 15 seconds
         });
 
 
