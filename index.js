@@ -56,8 +56,9 @@ app.post('/dare', async (req, res) => {
         browser = await puppeteer.launch({
             headless: true,
             executablePath: '/usr/bin/google-chrome',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process', '--no-zygote']
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--no-zygote', '--disable-features=FedCm']
         });
+
         const page = await browser.newPage();
 
         // Setup PDF handler
@@ -66,7 +67,7 @@ app.post('/dare', async (req, res) => {
         });
 
         // Navigate to form page
-        await page.goto('https://dare.sefin.ro.gov.br/avulso/dados-formulario?utf8=%E2%9C%93&c_o=1&ind=3&ident=53.254.947%2F0001-95');
+        await page.goto('https://dare.sefin.ro.gov.br/avulso/dados-formulario?utf8=%E2%9C%93&c_o=1&ind=3&ident=29.180.936%2F0001-23');
 
         // Fill form with request data
         await page.type('input[name="infor_notafiscal"]', req.body.invoiceNumber || '');
@@ -86,15 +87,34 @@ app.post('/dare', async (req, res) => {
         await page.type('input[name="data_vencimento"]', getNextMonthWeekdayDate());
         await page.type('input[name="mesano_referencia"]', getCurrentMonthAndYear());
 
+        await page.waitForSelector('#codigo_receita', { visible: false })
+        await page.evaluate(() => {
+            const el = document.querySelector('#codigo_receita')
+            if (!el) throw new Error('Hidden #codigo_receita não encontrado')
+
+
+            el.value = '1414'
+            el.setAttribute('value', '1414')
+
+
+            el.dispatchEvent(new Event('input', { bubbles: true }))
+            el.dispatchEvent(new Event('change', { bubbles: true }))
+        })
+
         // Handle receipt code
-        await page.$eval('input[name="codigo_receita"]', el => el.removeAttribute('readonly'));
-        await page.type('input[name="codigo_receita"]', req.body.receiptCode || '');
+        /* await page.$eval('input[name="codigo_receita"]', el => el.removeAttribute('readonly'));
+         await page.type('input[name="codigo_receita"]', req.body.receiptCode || '');*/
 
         // Submit form
-        await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle0' }),
-            page.click('button[name="button"]')
-        ]);
+        await page.click('button[name="button"]')
+        await page.waitForSelector('table.mb_20.text-size-13', {
+            visible: true,
+            timeout: 60000
+        })
+        /*await Promise.all([
+           page.waitForNavigation({ waitUntil: 'networkidle0' }),
+           page.click('button[name="button"]')
+       ]); */
         // Wait for document generation
 
         // Wait for the DARE document table to appear
