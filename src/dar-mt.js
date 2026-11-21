@@ -171,11 +171,28 @@ async function abrirFormulario(page, input, alertas) {
 }
 
 async function escolherMunicipio(page, input) {
-    const estado = await page.$eval('#municipio', el => ({
-        disabled: el.disabled,
-        atual: el.value && el.value !== '0' ? el.value : '',
-        opcoes: Array.from(el.options).map(o => ({ value: o.value, text: o.text.trim() })),
-    }))
+    // Com IE a SEFAZ usa o município do cadastro da inscrição: o #municipio vem
+    // como input oculto já preenchido e não há lista. Só CNPJ e CPF mostram o
+    // select. O laço é manual porque a página carrega o prototype.js 1.5, que
+    // troca o Array.from (com undefined ele devolve [] em vez de dar erro).
+    const estado = await page.$eval('#municipio', el => {
+        const opcoes = []
+        if (el.tagName === 'SELECT') {
+            for (let i = 0; i < el.options.length; i++) {
+                opcoes.push({ value: el.options[i].value, text: el.options[i].text.trim() })
+            }
+        }
+        return {
+            lista: el.tagName === 'SELECT',
+            disabled: el.disabled,
+            atual: el.value && el.value !== '0' ? el.value : '',
+            opcoes,
+        }
+    })
+    if (!estado.lista) {
+        if (estado.atual) return
+        throw new SefinError('A SEFAZ-MT não trouxe o município do cadastro desta inscrição estadual')
+    }
     if (!input.municipio) {
         if (estado.atual) return
         throw new InputError('Informe o município do remetente em MT')
