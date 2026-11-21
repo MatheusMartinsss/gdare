@@ -1,3 +1,4 @@
+const zlib = require('zlib')
 const { withPage } = require('./browser')
 const { SefinError, InputError, withRetry } = require('./errors')
 const { formatDate } = require('./datas')
@@ -276,16 +277,14 @@ async function preencher(page, input, alertas) {
     return { valor, porUnidade }
 }
 
-// Troca o submit do formulário por um fetch e guarda a resposta em window.__dar.
+// Troca os envios da página (form.submit, botão submit e window.open) por um
+// fetch e guarda a resposta em window.__dar. Roda de novo a cada página nova.
 async function capturarEnvio(page) {
     await page.evaluate(() => {
         window.__dar = null
-        const capturar = function () {
-            const form = this
-            const dados = new FormData(form)
-            const body = form.enctype === 'multipart/form-data' ? dados : new URLSearchParams(dados)
+        const baixar = (url, init) => {
             window.__dar = { estado: 'enviando' }
-            fetch(form.action, { method: (form.method || 'POST').toUpperCase(), body, credentials: 'same-origin' })
+            fetch(url, Object.assign({ credentials: 'same-origin' }, init))
                 .then(async r => {
                     const bytes = new Uint8Array(await r.arrayBuffer())
                     let bin = ''
@@ -302,8 +301,26 @@ async function capturarEnvio(page) {
                 })
                 .catch(e => { window.__dar = { estado: 'erro', erro: String(e) } })
         }
+        const capturar = function () {
+            const form = this
+            const metodo = (form.getAttribute('method') || 'GET').toUpperCase()
+            const dados = new FormData(form)
+            if (metodo === 'GET') {
+                const url = new URL(form.action, document.baseURI)
+                new URLSearchParams(dados).forEach((v, k) => url.searchParams.append(k, v))
+                return baixar(url.href, { method: 'GET' })
+            }
+            const body = form.enctype === 'multipart/form-data' ? dados : new URLSearchParams(dados)
+            baixar(form.action, { method: metodo, body })
+        }
+        window.__baixar = url => baixar(new URL(url, document.baseURI).href, { method: 'GET' })
         HTMLFormElement.prototype.submit = capturar
-        if (document.form && typeof document.form.submit === 'function') document.form.submit = capturar
+        for (let i = 0; i < document.forms.length; i++) document.forms[i].submit = capturar
+        document.addEventListener('submit', ev => { ev.preventDefault(); capturar.call(ev.target) }, true)
+        window.open = url => {
+            if (url) window.__baixar(url)
+            return { focus() { }, close() { }, document: { write() { }, close() { } } }
+        }
     })
 }
 
@@ -326,17 +343,14 @@ function extrairLinhaDigitavel(texto) {
     return m ? m[0].replace(/\s+/g, ' ').trim() : null
 }
 
-async function enviar(page, alertas) {
-    await capturarEnvio(page)
-    await page.evaluate(() => { setTimeout(() => emitir(), 0) })
-
+async function esperarEnvio(page, alertas, { validacao }) {
     const fim = Date.now() + TIMEOUT
     let resultado = null
     while (Date.now() < fim) {
         resultado = await avaliarSeguro(page, () => window.__dar)
         if (resultado && resultado.estado !== 'enviando') break
         // Alerta antes do envio é a validação do próprio formulário.
-        if (!resultado && alertas.length) throw erroDeAlerta(alertas)
+        if (validacao && !resultado && alertas.length) throw erroDeAlerta(alertas)
         await esperar(300)
     }
     if (!resultado || resultado.estado === 'enviando') {
@@ -344,19 +358,38 @@ async function enviar(page, alertas) {
     }
     if (resultado.estado === 'erro') throw new Error(`Falha ao enviar o DAR para a SEFAZ-MT: ${resultado.erro}`)
     if (resultado.status >= 400) throw new Error(`SEFAZ-MT respondeu ${resultado.status} ao gerar o DAR`)
+    return resultado
+}
 
-    const bytes = Buffer.from(resultado.base64, 'base64')
-    const ehPdf = /pdf/i.test(resultado.tipo) || bytes.subarray(0, 5).toString('latin1') === '%PDF-'
-    if (ehPdf) {
-        const texto = bytes.toString('latin1')
-        return { pdf: bytes, formato: 'pdf', linhaDigitavel: extrairLinhaDigitavel(texto) }
+const ehPdf = (bytes, tipo) => /pdf/i.test(tipo) || bytes.subarray(0, 5).toString('latin1') === '%PDF-'
+
+// O texto do PDF da SEFAZ-MT fica em streams comprimidos (FlateDecode).
+function textoDoPdf(bytes) {
+    const bruto = bytes.toString('latin1')
+    let texto = bruto
+    const re = /stream\r?\n/g
+    let m
+    while ((m = re.exec(bruto))) {
+        const ini = m.index + m[0].length
+        const fim = bruto.indexOf('endstream', ini)
+        if (fim < 0) break
+        try { texto += '\n' + zlib.inflateSync(bytes.subarray(ini, fim)).toString('latin1') } catch { /* stream não comprimido */ }
+        re.lastIndex = fim + 'endstream'.length
     }
+    return texto
+}
 
-    // Resposta em HTML: abre na mesma aba (com <base> para CSS e imagens) e imprime.
+const resultadoPdf = bytes => ({ pdf: bytes, formato: 'pdf', linhaDigitavel: extrairLinhaDigitavel(textoDoPdf(bytes)) })
+
+// Resposta em HTML: escreve no próprio documento da SEFAZ (com <base> da
+// resposta). Ao contrário do setContent, a página continua na origem
+// sefaz.mt.gov.br, então os scripts e formulários dela funcionam na sessão.
+async function abrirHtml(page, bytes, resultado, alertas) {
     const html = decodificarHtml(bytes, resultado.tipo)
     const base = `<base href="${resultado.url.replace(/"/g, '&quot;')}">`
     const comBase = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, m => m + base) : base + html
-    await page.setContent(comBase, { waitUntil: 'networkidle0', timeout: TIMEOUT }).catch(() => { })
+    await page.evaluate(h => { document.open(); document.write(h); document.close() }, comBase).catch(() => { })
+    await ociosa(page)
 
     const erro = await textoPaginaDeErro(page)
     if (erro) throw new SefinError(`SEFAZ-MT: ${erro}`)
@@ -364,10 +397,95 @@ async function enviar(page, alertas) {
         const voltouAoFormulario = await avaliarSeguro(page, () => !!document.querySelector('#tributo'))
         if (voltouAoFormulario) throw erroDeAlerta(alertas)
     }
+    return await avaliarSeguro(page, () => (document.body ? document.body.innerText : '')) || ''
+}
 
-    const texto = await avaliarSeguro(page, () => document.body.innerText) || ''
+// Botão "DAR/PDF" da tela de forma de pagamento.
+const BOTAO_DAR_PDF = '^\\s*DAR\\s*/?\\s*PDF\\s*$'
+
+function acharBotao(page, clicar) {
+    return avaliarSeguro(page, (re, clicar) => {
+        const els = document.querySelectorAll('input[type=button],input[type=submit],button,a')
+        for (let i = 0; i < els.length; i++) {
+            const el = els[i]
+            if (new RegExp(re, 'i').test(el.value || el.textContent || '')) {
+                if (clicar) setTimeout(() => el.click(), 0)
+                return true
+            }
+        }
+        return false
+    }, BOTAO_DAR_PDF, clicar)
+}
+
+// Resumo da página no log (sem valores dos campos), para ajustar o fluxo se a
+// SEFAZ mudar a tela de novo.
+async function registrarEstrutura(page, rotulo) {
+    const estrutura = await avaliarSeguro(page, () => {
+        const forms = []
+        for (let i = 0; i < document.forms.length; i++) {
+            const f = document.forms[i]
+            const campos = []
+            for (let j = 0; j < f.elements.length; j++) {
+                const el = f.elements[j]
+                campos.push(`${el.tagName.toLowerCase()}:${el.type || ''}:${el.name || el.id || ''}`)
+            }
+            forms.push({ name: f.getAttribute('name'), action: f.getAttribute('action'), method: f.getAttribute('method'), target: f.getAttribute('target'), campos })
+        }
+        const botoes = []
+        const els = document.querySelectorAll('input[type=button],input[type=submit],button,a[onclick],iframe,embed,object')
+        for (let i = 0; i < els.length; i++) botoes.push(els[i].outerHTML.slice(0, 400))
+        return { url: location.href, forms, botoes }
+    })
+    console.log(`[dar-mt] ${rotulo}: ${JSON.stringify(estrutura)}`)
+}
+
+async function imprimirPagina(page, texto) {
     const pdf = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' } })
     return { pdf, formato: 'html', linhaDigitavel: extrairLinhaDigitavel(texto) }
+}
+
+async function enviar(page, alertas) {
+    await capturarEnvio(page)
+    await page.evaluate(() => { setTimeout(() => emitir(), 0) })
+    const primeiro = await esperarEnvio(page, alertas, { validacao: true })
+    const bytes = Buffer.from(primeiro.base64, 'base64')
+    if (ehPdf(bytes, primeiro.tipo)) return resultadoPdf(bytes)
+
+    const texto = await abrirHtml(page, bytes, primeiro, alertas)
+
+    // Desde nov/2026 o pj/gerardar devolve "Selecione a Forma de Pagamento"
+    // (DAR/PDF ou PIX/QRCode). O DAR em PDF vem do botão DAR/PDF.
+    if (!/Forma de Pagamento/i.test(texto) || !(await acharBotao(page, false))) {
+        return imprimirPagina(page, texto)
+    }
+
+    await registrarEstrutura(page, 'forma de pagamento')
+    await capturarEnvio(page)
+    await acharBotao(page, true)
+
+    const segundo = await esperarEnvio(page, alertas, { validacao: false }).catch(error => {
+        throw new Error(`A SEFAZ-MT não devolveu o PDF após escolher DAR/PDF (${error.message})`)
+    })
+    const bytes2 = Buffer.from(segundo.base64, 'base64')
+    if (ehPdf(bytes2, segundo.tipo)) return resultadoPdf(bytes2)
+
+    // HTML de novo: o PDF pode vir embutido (iframe, embed ou object).
+    const texto2 = await abrirHtml(page, bytes2, segundo, alertas)
+    await registrarEstrutura(page, 'após DAR/PDF')
+    const embutido = await avaliarSeguro(page, () => {
+        const el = document.querySelector('iframe[src],embed[src],object[data]')
+        return el ? (el.getAttribute('src') || el.getAttribute('data')) : null
+    })
+    if (embutido) {
+        await capturarEnvio(page)
+        await page.evaluate(u => window.__baixar(u), embutido)
+        const terceiro = await esperarEnvio(page, alertas, { validacao: false })
+        const bytes3 = Buffer.from(terceiro.base64, 'base64')
+        if (ehPdf(bytes3, terceiro.tipo)) return resultadoPdf(bytes3)
+    }
+    const linha = extrairLinhaDigitavel(texto2)
+    throw new Error('A SEFAZ-MT não devolveu o DAR em PDF. Confira no portal se o DAR foi gerado.' +
+        (linha ? ` Linha digitável: ${linha}` : ''))
 }
 
 async function emitOnce(input, { dryRun }) {
