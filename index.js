@@ -1,158 +1,134 @@
-const express = require('express')
 require('dotenv').config()
+const crypto = require('crypto')
+const express = require('express')
+
+const { emitirDareRO } = require('./src/dare-ro')
+const { emitirDarMt } = require('./src/dar-mt')
+const { SefinError, InputError } = require('./src/errors')
+const browser = require('./src/browser')
+
 const app = express()
 const port = process.env.PORT || 8080
-const puppeteer = require('puppeteer');
-const path = require('path');
+const API_KEY = process.env.API_KEY || ''
 
-const fs = require('fs')
+app.use(express.json({ limit: '1mb' }))
 
-// Middleware to parse JSON requests
-app.use(express.json())
-
-app.listen(port, () => {
-    console.log(`Servidor rodando na porta ${port}`)
+// Com API_KEY definida, toda rota (menos /health) exige o header x-api-key.
+// Sem ela o serviço continua aberto como antes, para não quebrar clientes
+// antigos durante a migração.
+app.use((req, res, next) => {
+    if (!API_KEY || req.path === '/health') return next()
+    const received = req.get('x-api-key') || ''
+    const ok = received.length === API_KEY.length &&
+        crypto.timingSafeEqual(Buffer.from(received), Buffer.from(API_KEY))
+    if (!ok) return res.status(401).json({ error: 'API key inválida' })
+    next()
 })
 
-app.post('/dare', async (req, res) => {
-    console.log(req.body)
-    let browser;
-    try {
-        // Date calculation functions
-        function isWeekend(date) {
-            const day = date.getDay();
-            return day === 0 || day === 6;
-        }
+function sendError(res, error, requestId) {
+    if (res.headersSent) return
+    if (error instanceof InputError) return res.status(400).json({ error: error.message, requestId })
+    if (error instanceof SefinError) return res.status(422).json({ error: error.message, requestId })
+    return res.status(502).json({ error: `Falha ao gerar o documento na SEFIN: ${error.message}`, requestId })
+}
 
-        function getCurrentMonthAndYear() {
-            const currentDate = new Date();
-            const month = String(currentDate.getMonth() + 1).padStart(2, '0')
-            const year = currentDate.getFullYear()
-            return `${month}/${year}`
-        }
-
-        function getNextMonthWeekdayDate() {
-            const currentDate = new Date();
-            const nextMonthDate = new Date(currentDate);
-            nextMonthDate.setMonth(currentDate.getMonth() + 1);
-
-            if (nextMonthDate.getDate() !== currentDate.getDate()) {
-                nextMonthDate.setMonth(nextMonthDate.getMonth() + 1, 0);
-            }
-
-            let attempts = 0;
-            while (isWeekend(nextMonthDate)) {
-                nextMonthDate.setDate(nextMonthDate.getDate() + 1);
-                attempts++;
-            }
-
-            const day = String(nextMonthDate.getDate()).padStart(2, '0')
-            const month = String(nextMonthDate.getMonth() + 1).padStart(2, '0')
-            const year = nextMonthDate.getFullYear()
-            return `${day}/${month}/${year}`
-        }
-
-        // Launch browser and create page
-        browser = await puppeteer.launch({
-            headless: true,
-            executablePath: '/usr/bin/google-chrome',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--no-zygote', '--disable-features=FedCm']
-        });
-
-        const page = await browser.newPage();
-
-        // Setup PDF handler
-        await page.evaluateOnNewDocument(() => {
-            window.print = () => { };
-        });
-
-        // Navigate to form page
-        await page.goto('https://dare.sefin.ro.gov.br/avulso/dados-formulario?utf8=%E2%9C%93&c_o=1&ind=3&ident=29.180.936%2F0001-23');
-
-        // Fill form with request data
-        await page.type('input[name="infor_notafiscal"]', req.body.invoiceNumber || '');
-        await page.type('input[name="infor_destinatario"]', req.body.recipient || '');
-        await page.type('input[name="infor_origem"]', req.body.origin || '');
-        await page.type('input[name="infor_destino"]', req.body.destination || '');
-        await page.type('input[name="infor_produto"]', req.body.product || '');
-        await page.$eval('input[name="infor_basecalculo"]', el => {
-            el.value = '';  // Clear current value
-            el.dispatchEvent(new Event('input', { bubbles: true })); // Trigger input event
-        });
-        await page.type('input[name="infor_basecalculo"]', String(req.body.calculationBase) || '');
-        await page.type('input[name="valor_principal"]', req.body.value || '');
-
-        // Handle date fields
-        await page.$eval('input[name="data_vencimento"]', el => el.removeAttribute('readonly'));
-        await page.type('input[name="data_vencimento"]', getNextMonthWeekdayDate());
-        await page.type('input[name="mesano_referencia"]', getCurrentMonthAndYear());
-
-        await page.waitForSelector('#codigo_receita', { visible: false })
-        await page.evaluate(() => {
-            const el = document.querySelector('#codigo_receita')
-            if (!el) throw new Error('Hidden #codigo_receita não encontrado')
-
-
-            el.value = '1414'
-            el.setAttribute('value', '1414')
-
-
-            el.dispatchEvent(new Event('input', { bubbles: true }))
-            el.dispatchEvent(new Event('change', { bubbles: true }))
-        })
-
-        // Handle receipt code
-        /* await page.$eval('input[name="codigo_receita"]', el => el.removeAttribute('readonly'));
-         await page.type('input[name="codigo_receita"]', req.body.receiptCode || '');*/
-
-        // Submit form
-        await page.click('button[name="button"]')
-        await page.waitForSelector('table.mb_20.text-size-13', {
-            visible: true,
-            timeout: 60000
-        })
-        /*await Promise.all([
-           page.waitForNavigation({ waitUntil: 'networkidle0' }),
-           page.click('button[name="button"]')
-       ]); */
-        // Wait for document generation
-
-        // Wait for the DARE document table to appear
-        await page.waitForSelector('table.mb_20.text-size-13', {
-            visible: true,
-            timeout: 30000 // 15 seconds
-        });
-
-
-
-        const pdfBuffer = await page.pdf({
-            format: 'A4',
-            printBackground: true,
-            margin: { top: '20mm', right: '20mm', bottom: '20mm', left: '20mm' }
-        });
-
-        const fileName = `temp.pdf`
-        const filePath = path.join(__dirname, fileName);
-        fs.writeFileSync(filePath, pdfBuffer);
-
-        // 2. Send the saved file
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
-
-        // Option 1: Read file and send buffer
-        const savedFileBuffer = fs.readFileSync(filePath);
-        res.send(savedFileBuffer)
-
-
-        // Send PDF to client
-
-    } catch (error) {
-        console.error('Error:', error);
-        // Ensure we only send one response
-        if (!res.headersSent) {
-            res.status(500).send('Error generating PDF: ' + error.message);
-        }
-    } finally {
-        if (browser) await browser.close();
+function sendPdf(res, pdf, fileName, extraHeaders = {}) {
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename=${fileName}`)
+    for (const [key, value] of Object.entries(extraHeaders)) {
+        if (value) res.setHeader(key, value)
     }
-});
+    res.send(Buffer.from(pdf))
+}
+
+app.get('/health', async (_req, res) => {
+    res.json({ ok: true, ...(await browser.status()) })
+})
+
+// DARE avulso SEFIN-RO (ICMS sobre frete). Campos aceitos, em inglês (formato
+// antigo) ou em português:
+//   cnpj, invoiceNumber|notaFiscal, recipient|destinatario, origin|origem,
+//   destination|destino, product|produto, calculationBase|baseCalculo,
+//   value|valor, receiptCode|codigoReceita, dataVencimento (dd/mm/aaaa),
+//   mesReferencia (mm/aaaa), contribuinte { nome, cep, endereco, municipio,
+//   uf, telefone, codigoMunicipio }, dryRun (só preenche e devolve um PNG).
+app.post('/dare', async (req, res) => {
+    const requestId = crypto.randomUUID().slice(0, 8)
+    const started = Date.now()
+    const dryRun = req.body?.dryRun === true || req.query.dryRun === 'true'
+    try {
+        const result = await emitirDareRO(req.body, { dryRun })
+        const { input } = result
+        console.log(`[dare ${requestId}] ok cnpj=${input.cnpj} nf=${input.notaFiscal} valor=${input.valor} ${Date.now() - started}ms${dryRun ? ' (dry-run)' : ''}`)
+
+        if (result.kind === 'dry-run') {
+            res.setHeader('Content-Type', 'image/png')
+            return res.send(Buffer.from(result.screenshot))
+        }
+        sendPdf(res, result.pdf, `dare-${input.notaFiscal || requestId}.pdf`, {
+            'X-Request-Id': requestId,
+            'X-Linha-Digitavel': result.linhaDigitavel,
+            'X-Data-Vencimento': input.dataVencimento,
+            'X-Mes-Referencia': input.mesReferencia,
+        })
+    } catch (error) {
+        console.error(`[dare ${requestId}] erro ${Date.now() - started}ms: ${error.message}`)
+        sendError(res, error, requestId)
+    }
+})
+
+// DAR avulso SEFAZ-MT (FETHAB e contribuições às entidades). Campos:
+//   documento { tipo: 'ie'|'cnpj'|'cpf', numero }, codigoReceita (ex. 7237),
+//   periodoReferencia (mm/aaaa), dataVencimento (dd/mm/aaaa, padrão hoje),
+//   quantidade (número), municipio (nome do município do remetente em MT),
+//   informacoes (até 220 caracteres), valorEsperado (opcional: aborta antes
+//   de emitir se a SEFAZ calcular outro valor), dryRun (só preenche e devolve
+//   um PNG, sem emitir).
+async function darMt(req, res) {
+    const requestId = crypto.randomUUID().slice(0, 8)
+    const started = Date.now()
+    const dryRun = req.body?.dryRun === true || req.query.dryRun === 'true'
+    try {
+        const result = await emitirDarMt(req.body, { dryRun })
+        const { input } = result
+        console.log(`[dar-mt ${requestId}] ok ${input.documento.tipo} receita=${input.codigoReceita} valor=${result.valor} ${Date.now() - started}ms${dryRun ? ' (dry-run)' : ` (${result.formato})`}`)
+        const valor = result.valor.toFixed(2)
+
+        if (result.kind === 'dry-run') {
+            res.setHeader('Content-Type', 'image/png')
+            res.setHeader('X-Valor', valor)
+            res.setHeader('X-Valor-Unidade', String(result.porUnidade))
+            return res.send(Buffer.from(result.screenshot))
+        }
+        sendPdf(res, result.pdf, `dar-mt-${input.codigoReceita}-${requestId}.pdf`, {
+            'X-Request-Id': requestId,
+            'X-Linha-Digitavel': result.linhaDigitavel,
+            'X-Valor': valor,
+            'X-Data-Vencimento': input.dataVencimento,
+            'X-Periodo-Referencia': input.periodoReferencia,
+            'X-Formato-Sefaz': result.formato,
+        })
+    } catch (error) {
+        console.error(`[dar-mt ${requestId}] erro ${Date.now() - started}ms: ${error.message}`)
+        sendError(res, error, requestId)
+    }
+}
+
+app.post('/dar-mt', darMt)
+// Nome antigo, mantido por compatibilidade.
+app.post('/dare-mt-fethab', darMt)
+
+const server = app.listen(port, () => {
+    console.log(`Servidor rodando na porta ${port}`)
+    // Abre o Chrome já na subida para a primeira emissão não pagar esse custo.
+    browser.getBrowser().catch(error => console.error('[browser] falha ao abrir o Chrome:', error.message))
+})
+
+async function shutdown(signal) {
+    console.log(`${signal} recebido, encerrando`)
+    server.close()
+    await browser.closeBrowser()
+    process.exit(0)
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
